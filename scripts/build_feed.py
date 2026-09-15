@@ -33,6 +33,15 @@ def field_text(item: ET.Element, name: str) -> str:
     return ""
 
 
+def is_product_record(element: ET.Element) -> bool:
+    fields = {local_name(child.tag) for child in element}
+    has_identity = "id" in fields and "title" in fields
+    has_catalog_data = bool(
+        fields.intersection({"price", "availability", "image_link", "link"})
+    )
+    return has_identity and has_catalog_data
+
+
 def is_available(item: ET.Element) -> bool:
     value = field_text(item, "availability").lower().replace("_", " ")
     return value in {"in stock", "available for order", "preorder", "pre order"}
@@ -44,6 +53,15 @@ def choose_representative(items: list[ET.Element]) -> ET.Element:
     return next((item for item in items if is_available(item)), items[0])
 
 
+def to_google_field(source: ET.Element) -> ET.Element:
+    converted = ET.Element(f"{{{GOOGLE_NS}}}{local_name(source.tag)}", source.attrib)
+    converted.text = source.text
+    converted.tail = source.tail
+    for child in source:
+        converted.append(to_google_field(child))
+    return converted
+
+
 def main() -> None:
     request = urllib.request.Request(
         SOURCE_URL,
@@ -52,48 +70,51 @@ def main() -> None:
     with urllib.request.urlopen(request, timeout=60) as response:
         source_xml = response.read()
 
-    tree = ET.parse(BytesIO(source_xml))
-    root = tree.getroot()
-    channel = next(
-        (element for element in root.iter() if local_name(element.tag) == "channel"),
-        None,
-    )
-    if channel is None:
-        raise RuntimeError("The BASE feed does not contain an RSS channel.")
-
+    source_tree = ET.parse(BytesIO(source_xml))
+    source_root = source_tree.getroot()
     source_items = [
-        child for child in list(channel) if local_name(child.tag) == "item"
+        element for element in source_root.iter() if is_product_record(element)
     ]
     if not source_items:
-        raise RuntimeError("The BASE feed contains no product items.")
+        root_tag = local_name(source_root.tag)
+        child_tags = sorted({local_name(child.tag) for child in source_root.iter()})
+        raise RuntimeError(
+            f"No product records found. root={root_tag}; tags={child_tags[:30]}"
+        )
 
     groups: OrderedDict[str, list[ET.Element]] = OrderedDict()
     for item in source_items:
         item_id = field_text(item, "id")
         group_id = field_text(item, "item_group_id")
         key = group_id or item_id
-        if not key:
-            raise RuntimeError("A product item has neither id nor item_group_id.")
         groups.setdefault(key, []).append(item)
 
-    representatives: list[ET.Element] = []
-    for variants in groups.values():
-        representative = copy.deepcopy(choose_representative(variants))
-        for child in list(representative):
-            if local_name(child.tag) == "item_group_id":
-                representative.remove(child)
-        representatives.append(representative)
+    output_root = ET.Element("rss", {"version": "2.0"})
+    output_channel = ET.SubElement(output_root, "channel")
+    ET.SubElement(output_channel, "title").text = "Starry J BASE Products"
+    ET.SubElement(output_channel, "link").text = "https://shop.starry-j.online"
+    ET.SubElement(output_channel, "description").text = (
+        "Deduplicated product feed for Meta and Instagram"
+    )
 
-    for item in source_items:
-        channel.remove(item)
-    channel.extend(representatives)
+    for variants in groups.values():
+        representative = choose_representative(variants)
+        output_item = ET.SubElement(output_channel, "item")
+        for child in representative:
+            if local_name(child.tag) == "item_group_id":
+                continue
+            output_item.append(to_google_field(copy.deepcopy(child)))
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tree.write(OUTPUT_PATH, encoding="utf-8", xml_declaration=True)
+    ET.ElementTree(output_root).write(
+        OUTPUT_PATH,
+        encoding="utf-8",
+        xml_declaration=True,
+    )
 
     print(
         f"Built {OUTPUT_PATH}: {len(source_items)} variants -> "
-        f"{len(representatives)} products"
+        f"{len(groups)} products"
     )
 
 
